@@ -1,6 +1,7 @@
 # Author:
 #  Romain de Reydellet (@pentest_soka)
 from nxc.helpers.logger import highlight
+from nxc.helpers.misc import CATEGORY
 
 
 class User:
@@ -23,8 +24,7 @@ class NXCModule:
     name = "mssql_priv"
     description = "Enumerate and exploit MSSQL privileges"
     supported_protocols = ["mssql"]
-    opsec_safe = True
-    multiple_hosts = True
+    category = CATEGORY.PRIVILEGE_ESCALATION
 
     def __init__(self):
         self.admin_privs = None
@@ -219,6 +219,7 @@ class NXCModule:
         """
         if self.is_admin_user(user.username):
             user.is_sysadmin = True
+            self.context.log.debug(f"Updated {user.username} to is_sysadmin")
             return True
         user.dbowner = self.check_dbowner_privesc(exec_as)
         return user.dbowner
@@ -249,11 +250,15 @@ class NXCModule:
         self.revert_context(exec_as)
         is_admin = res[0][""]
         self.context.log.debug(f"IsAdmin Result: {is_admin}")
-        if is_admin:
-            self.context.log.debug("User is admin!")
-            self.admin_privs = True
-            return True
-        else:
+        try:
+            if int(is_admin):
+                self.context.log.debug("User is admin!")
+                self.admin_privs = True
+                return True
+            else:
+                return False
+        except ValueError:
+            self.logger.fail(f"Error checking if user is admin, got {is_admin} as response. Expected 0 or 1.")
             return False
 
     def get_databases(self, exec_as="") -> list:
@@ -295,9 +300,7 @@ class NXCModule:
             WHERE rp.name = 'db_owner' AND mp.name = SYSTEM_USER
         """
         res = self.query_and_get_output(exec_as + query)
-        if res and "database_role" in res[0] and res[0]["database_role"] == "db_owner":
-            return True
-        return False
+        return bool(res and "database_role" in res[0] and res[0]["database_role"] == "db_owner")
 
     def find_dbowner_priv(self, databases, exec_as="") -> list:
         """
@@ -442,10 +445,15 @@ class NXCModule:
         """
         res = self.query_and_get_output(f"SELECT IS_SRVROLEMEMBER('sysadmin', '{username}')")
         is_admin = res[0][""]
-        if is_admin:
-            self.admin_privs = True
-            return True
-        else:
+        try:
+            if is_admin != "NULL" and int(is_admin):
+                self.admin_privs = True
+                self.context.log.debug(f"Updated: {username} is admin!")
+                return True
+            else:
+                return False
+        except ValueError:
+            self.context.log.fail(f"Error checking if user is admin, got {is_admin} as response. Expected 0 or 1.")
             return False
 
     def revert_context(self, exec_as):

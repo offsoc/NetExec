@@ -5,10 +5,11 @@ import time
 
 from impacket.system_errors import ERROR_NO_MORE_ITEMS, ERROR_FILE_NOT_FOUND, ERROR_OBJECT_NOT_FOUND
 from termcolor import colored
-
+from nxc.helpers.misc import CATEGORY
 from nxc.logger import nxc_logger
 from impacket.dcerpc.v5 import rrp, samr, scmr
 from impacket.dcerpc.v5.rrp import DCERPCSessionError
+from impacket.dcerpc.v5.rpcrt import DCERPCException
 from impacket.smbconnection import SessionError as SMBSessionError
 from impacket.examples.secretsdump import RemoteOperations
 
@@ -53,7 +54,7 @@ class ConfigCheck:
         self.reasons = []
 
     def run(self):
-        for checker, args, kwargs in zip(self.checkers, self.checker_args, self.checker_kwargs):
+        for checker, args, kwargs in zip(self.checkers, self.checker_args, self.checker_kwargs, strict=True):
             if checker is None:
                 checker = HostChecker.check_registry
 
@@ -86,13 +87,12 @@ class NXCModule:
     name = "wcc"
     description = "Check various security configuration items on Windows machines"
     supported_protocols = ["smb"]
-    opsec_safe = True
-    multiple_hosts = True
-    
+    category = CATEGORY.ENUMERATION
+
     def __init__(self):
         self.context = None
         self.module_options = None
-        
+
         self.wcc_logger = logging.getLogger("WCC")
         self.wcc_logger.propagate = False
         log_filename = nxc_logger.init_log_file()
@@ -122,8 +122,6 @@ class NXCModule:
         self.results.setdefault(connection.host, {"checks": []})
         self.context = context
         HostChecker(context, connection).run()
-
-    def on_shutdown(self, context, connection):
         if self.output is not None:
             self.export_results()
 
@@ -160,7 +158,7 @@ class HostChecker:
     def run(self):
         self.init_checks()
         self.check_config()
-        
+
     def init_checks(self):
         # Declare the checks to do and how to do them
         self.checks = [
@@ -173,13 +171,14 @@ class HostChecker:
             ConfigCheck("IPv4 preferred over IPv6", "Checks if IPv4 is preferred over IPv6", checker_args=[[self, ("HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters", "DisabledComponents", (32, 255), in_)]]),
             ConfigCheck("Spooler service disabled", "Checks if the spooler service is disabled", checkers=[self.check_spooler_service]),
             ConfigCheck("WDigest authentication disabled", "Checks if WDigest authentication is disabled", checker_args=[[self, ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest", "UseLogonCredential", 0)]]),
-            ConfigCheck("WSUS configuration", "Checks if WSUS configuration uses HTTPS", checkers=[self.check_wsus_running, None], checker_args=[[], [self, ("HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate", "WUServer", "https://", startswith), ("HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate", "UseWUServer", 0, operator.eq)]], checker_kwargs=[{}, {"options": {"lastWins": True}}]),
+            ConfigCheck("WSUS configuration", "Checks if WSUS configuration uses HTTPS", checkers=[self.check_wsus_running, None], checker_args=[[], [self, ("HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate", "WUServer", "https://", startswith), ("HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "UseWUServer", 0, operator.eq)]], checker_kwargs=[{}, {"options": {"lastWins": True}}]),
             ConfigCheck("Small LSA cache", "Checks how many logons are kept in the LSA cache", checker_args=[[self, ("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "CachedLogonsCount", 2, le)]]),
             ConfigCheck("AppLocker rules defined", "Checks if there are AppLocker rules defined", checkers=[self.check_applocker]),
             ConfigCheck("RDP expiration time", "Checks RDP session timeout", checker_args=[[self, ("HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services", "MaxDisconnectionTime", 0, operator.gt), ("HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services", "MaxDisconnectionTime", 0, operator.gt)]]),
             ConfigCheck("CredentialGuard enabled", "Checks if CredentialGuard is enabled", checker_args=[[self, ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity", 1), ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa", "LsaCfgFlags", 1)]]),
             ConfigCheck("Lsass run as PPL", "Checks if lsass runs as a protected process", checker_args=[[self, ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa", "RunAsPPL", 1)]]),
             ConfigCheck("No Powershell v2", "Checks if powershell v2 is available", checker_args=[[self, ("HKLM\\SOFTWARE\\Microsoft\\PowerShell\\3\\PowerShellEngine", "PSCompatibleVersion", "2.0", not_(operator.contains))]]),
+            ConfigCheck("LLMNR disabled", "Checks if LLMNR is disabled", checker_args=[[self, ("HKLM\\Software\\policies\\Microsoft\\Windows NT\\DNSClient", "EnableMulticast", 0)]]),
             ConfigCheck("LmCompatibilityLevel == 5", "Checks if LmCompatibilityLevel is set to 5", checker_args=[[self, ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa", "LmCompatibilityLevel", 5, operator.ge)]]),
             ConfigCheck("NBTNS disabled", "Checks if NBTNS is disabled on all interfaces", checkers=[self.check_nbtns]),
             ConfigCheck("mDNS disabled", "Checks if mDNS is disabled", checker_args=[[self, ("HKLM\\SYSTEM\\CurrentControlSet\\Services\\DNScache\\Parameters", "EnableMDNS", 0)]]),
@@ -190,7 +189,15 @@ class HostChecker:
             ConfigCheck("BitLocker configuration", "Checks the BitLocker configuration (based on https://www.stigviewer.com/stig/windows_10/2020-06-15/finding/V-94859)", checker_args=[[self, ("HKLM\\SOFTWARE\\Policies\\Microsoft\\FVE", "UseAdvancedStartup", 1), ("HKLM\\SOFTWARE\\Policies\\Microsoft\\FVE", "UseTPMPIN", 1)]]),
             ConfigCheck("Guest account disabled", "Checks if the guest account is disabled", checkers=[self.check_guest_account_disabled]),
             ConfigCheck("Automatic session lock enabled", "Checks if the session is automatically locked on after a period of inactivity", checker_args=[[self, ("HKCU\\Control Panel\\Desktop", "ScreenSaverIsSecure", 1), ("HKCU\\Control Panel\\Desktop", "ScreenSaveTimeOut", 300, le)]]),
-            ConfigCheck('Powershell Execution Policy == "Restricted"', 'Checks if the Powershell execution policy is set to "Restricted"', checker_args=[[self, ("HKLM\\SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.Powershell", "ExecutionPolicy", "Restricted\x00"), ("HKCU\\SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.Powershell", "ExecutionPolicy", "Restricted\x00")]], checker_kwargs=[{"options": {"KOIfMissing": False, "lastWins": True}}])
+            ConfigCheck('Powershell Execution Policy == "Restricted"', 'Checks if the Powershell execution policy is set to "Restricted"', checker_args=[[self, ("HKLM\\SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.Powershell", "ExecutionPolicy", "Restricted\x00"), ("HKCU\\SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.Powershell", "ExecutionPolicy", "Restricted\x00")]], checker_kwargs=[{"options": {"KOIfMissing": False, "lastWins": True}}]),
+            ConfigCheck("Defender service running", "Checks if defender service is enabled", checkers=[self.check_defender_service]),
+            ConfigCheck("Defender Tamper Protection enabled", "Check if Defender Tamper Protection is enabled", checker_args=[[self, ("HKLM\\Software\\Microsoft\\Windows Defender\\Features", "TamperProtection", 5)]]),
+            ConfigCheck("Defender RealTime Monitoring enabled", "Check if Defender RealTime Monitoring is enabled", checker_args=[[self, ("HKLM\\Software\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableRealtimeMonitoring", 0), ("HKLM\\Software\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableRealtimeMonitoring", 0)]], checker_kwargs=[{"options": {"lastWins": True, "stopOnOK": True}}]),
+            ConfigCheck("Defender IOAV Protection enabled", "Check if Defender IOAV Protection is enabled", checker_args=[[self, ("HKLM\\Software\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableIOAVProtection", 0), ("HKLM\\Software\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableIOAVProtection", 0)]], checker_kwargs=[{"options": {"lastWins": True, "stopOnOK": True}}]),
+            ConfigCheck("Defender Behaviour Monitoring enabled", "Check if Defender Behaviour Monitoring is enabled", checker_args=[[self, ("HKLM\\Software\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableBehaviourMonitoring", 0), ("HKLM\\Software\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableBehaviourMonitoring", 0)]], checker_kwargs=[{"options": {"lastWins": True, "stopOnOK": True}}]),
+            ConfigCheck("Defender Script Scanning enabled", "Check if Defender Script Scanning is enabled", checker_args=[[self, ("HKLM\\Software\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableScriptScanning", 0), ("HKLM\\Software\\Microsoft\\Windows Defender\\Real-Time Protection", "DisableScriptScanning", 0)]], checker_kwargs=[{"options": {"lastWins": True, "stopOnOK": True}}]),
+            ConfigCheck("Defender no path exclusions", "Checks Defender path exclusion", checkers=[self.check_defender_exclusion], checker_args=[("HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Paths", "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths")]),
+            ConfigCheck("Defender no extension exclusions", "Checks Defender extension exclusion", checkers=[self.check_defender_exclusion], checker_args=[("HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Extensions", "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Extensions")])
         ]
 
         # Add check to conf_checks table if missing
@@ -243,7 +250,7 @@ class HostChecker:
             if host_id is not None:
                 self.connection.db.add_check_result(host_id, check.check_id, check.ok, ", ".join(check.reasons).replace("\x00", ""))
 
-    def check_registry(self, *specs, options=None):
+    def check_registry(self, *specs, options=None, stop_on_error=False):
         """
         Perform checks that only require to compare values in the registry with expected values, according to the specs
         a spec may be either a 3-tuple: (key name, value name, expected value), or a 4-tuple (key name, value name, expected value, operation), where operation is a function that implements a comparison operator
@@ -261,6 +268,7 @@ class HostChecker:
             try:
                 if len(spec) == 3:
                     (key, value_name, expected_value) = spec
+                    op = operator.eq
                 elif len(spec) == 4:
                     (key, value_name, expected_value, op) = spec
                 else:
@@ -268,7 +276,7 @@ class HostChecker:
                     reasons = ["Check could not be performed (invalid specification provided)"]
                     return ok, reasons
             except Exception as e:
-                self.module.log.error(f"Check could not be performed. Details: specs={specs}, dce={self.dce}, error: {e}")
+                self.context.log.error(f"Check could not be performed. Details: specs={specs}, dce={self.dce}, error: {e}")
                 return ok, reasons
 
             if op == operator.eq:
@@ -298,7 +306,7 @@ class HostChecker:
 
             value = self.reg_query_value(self.dce, self.connection, key, value_name)
 
-            if type(value) == DCERPCSessionError:
+            if isinstance(value, DCERPCSessionError):
                 if options["KOIfMissing"]:
                     ok = False
                 if value.error_code in (ERROR_NO_MORE_ITEMS, ERROR_FILE_NOT_FOUND):
@@ -308,6 +316,9 @@ class HostChecker:
                 else:
                     ok = False
                     reasons.append(f"Error while retrieving value of {key}\\{value_name}: {value}")
+                if stop_on_error:
+                    ok = None
+                    return ok, reasons
                 continue
 
             if op(value, expected_value):
@@ -443,15 +454,23 @@ class HostChecker:
         return ok, reasons
 
     def check_nbtns(self):
+        adapters_key = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}"
         key_name = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\NetBT\\Parameters\\Interfaces"
         subkeys = self.reg_get_subkeys(self.dce, self.connection, key_name)
         success = False
         reasons = []
         missing = 0
         nbtns_enabled = 0
+
         for subkey in subkeys:
+            # Ignore Microsoft Kernel Debug Network Adapter
+            kdnic_key = adapters_key + "\\0000"
+            kdnic_uuid = self.reg_query_value(self.dce, self.connection, kdnic_key, "NetCfgInstanceId")
+            if subkey.lower() == ("Tcpip_" + kdnic_uuid).replace("\x00", "").lower():
+                continue
+
             value = self.reg_query_value(self.dce, self.connection, key_name + "\\" + subkey, "NetbiosOptions")
-            if type(value) == DCERPCSessionError:
+            if isinstance(value, DCERPCSessionError):
                 if value.error_code == ERROR_OBJECT_NOT_FOUND:
                     missing += 1
                 continue
@@ -478,6 +497,78 @@ class HostChecker:
         reasons = [f"Found {rule_count} AppLocker rules defined"]
 
         return success, reasons
+
+    def get_exclusions(self, key_name):
+        exclusions = []
+        try:
+            values = self.reg_query_value(self.dce, self.connection, key_name, valueName=None, all_value=True)
+            for _, value_name, _ in values:
+                exclusions.append(value_name)
+        except Exception:
+            self.context.log.debug("No defender exclusion policies")
+
+        return len(exclusions), exclusions
+
+    def check_defender_exclusion(self, *spec, options=None):
+        try:
+            if len(spec) == 2:
+                (policy_key_name, key_name) = spec
+            else:
+                ok = False
+                reasons = ["Check could not be performed (invalid specification provided)"]
+                return ok, reasons
+        except Exception as e:
+            self.context.log.error(f"Check could not be performed. Details: spec={spec}, dce={self.dce}, error: {e}")
+            return ok, reasons
+
+        reasons = []
+        success = True
+
+        count, exclusions_p = self.get_exclusions(policy_key_name)
+        reasons = [f"Policy: [{', '.join(exclusions_p)}]"]
+        count_k, exclusions_k = self.get_exclusions(key_name)
+        reasons.append(f"Manual: [{', '.join(exclusions_k)}]")
+        count += count_k
+
+        if count > 0:
+            success = False
+
+        return success, reasons
+
+    def check_defender_service(self):
+        ok = True
+        raised = False
+        reasons = []
+        try:
+            service_config, service_status = self.get_service("windefend", self.connection)
+            if service_status == scmr.SERVICE_RUNNING:
+                reasons.append("windefend service running")
+            elif service_status == scmr.SERVICE_STOPPED:
+                ok = False
+                reasons.append("windefend service not running")
+        except DCERPCException as e:
+            ok = True
+            raised = True
+            reasons = [f"windefend service check error({e})"]
+        if ok is False or raised is True:
+            try:
+                service_config, service_status = self.get_service("sense", self.connection)
+                if service_status == scmr.SERVICE_RUNNING:
+                    reasons.append("sense service running")
+                elif service_status == scmr.SERVICE_STOPPED:
+                    ok = False
+                    reasons.append("sense service not running")
+            except DCERPCException as e:
+                ok = True
+                raised = True
+                reasons.append(f"sense service check error({e})")
+        if raised is True:
+            reasons_save = reasons
+            args = ("HKLM\\SOFTWARE\\Microsoft\\Windows Defender", "IsServiceRunning", 1)
+            ok, reasons = self.check_registry(args)
+            reasons.extend(reasons_save)
+
+        return ok, reasons
 
     def _open_root_key(self, dce, connection, root_key):
         ans = None
@@ -527,7 +618,7 @@ class HostChecker:
                 break
         return subkeys
 
-    def reg_query_value(self, dce, connection, keyName, valueName=None):
+    def reg_query_value(self, dce, connection, keyName, valueName=None, all_value=False):
         """Query remote registry data for a given registry value"""
 
         def subkey_values(subkey_handle):
@@ -580,8 +671,10 @@ class HostChecker:
 
         subkey_handle = ans["phkResult"]
 
-        if valueName is None:
+        if valueName is None and all_value is False:
             return get_value(subkey_handle)[2]
+        elif valueName is None and all_value is True:
+            return subkey_values(subkey_handle)
         else:
             for _, name, data in subkey_values(subkey_handle):
                 if name.upper() == valueName.upper():
@@ -635,14 +728,18 @@ class HostChecker:
             self.context.log.error(f"ls(): C:\\{path} {e}\n")
         return file_listing
 
+
 def le(reg_sz_string, number):
     return int(reg_sz_string[:-1]) <= number
+
 
 def in_(obj, seq):
     return obj in seq
 
+
 def startswith(string, start):
     return string.startswith(start)
+
 
 def not_(boolean_operator):
     def wrapper(*args, **kwargs):
